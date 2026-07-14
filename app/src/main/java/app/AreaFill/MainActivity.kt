@@ -28,6 +28,8 @@ import androidx.compose.ui.input.pointer.*
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.core.view.WindowCompat
 import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.text.font.FontFamily
@@ -377,6 +379,74 @@ class LivesManager(context: Context) {
     }
 }
 
+// ─── Progress (completed / unlocked levels) ─────────────────────────────────────
+class ProgressManager(context: Context) {
+    private val prefs = context.applicationContext.getSharedPreferences("areafill_prefs", Context.MODE_PRIVATE)
+
+    var completedLevels: Set<Int>
+        get() = prefs.getString("completed_levels", "")!!
+            .split(",")
+            .mapNotNull { it.toIntOrNull() }
+            .toSet()
+        private set(value) = prefs.edit().putString("completed_levels", value.joinToString(",")).apply()
+
+    fun markCompleted(levelIdx: Int) {
+        completedLevels = completedLevels + levelIdx
+    }
+}
+
+// ─── Hints ─────────────────────────────────────────────────────────────────────
+class HintsManager(context: Context) {
+    companion object {
+        const val INITIAL_HINTS      = 5
+        const val MAX_AD_HINTS_A_DAY = 5
+    }
+
+    private val prefs = context.applicationContext.getSharedPreferences("areafill_prefs", Context.MODE_PRIVATE)
+
+    var balance: Int
+        get() = prefs.getInt("hints_balance", INITIAL_HINTS)
+        private set(value) = prefs.edit().putInt("hints_balance", value).apply()
+
+    private var adHintsDay: Int
+        get() = prefs.getInt("ad_hints_day", -1)
+        set(value) = prefs.edit().putInt("ad_hints_day", value).apply()
+
+    private var adHintsCountToday: Int
+        get() = prefs.getInt("ad_hints_count", 0)
+        set(value) = prefs.edit().putInt("ad_hints_count", value).apply()
+
+    private fun todayEpochDay(): Int = (System.currentTimeMillis() / (24 * 60 * 60 * 1000L)).toInt()
+
+    private fun rolloverIfNeeded() {
+        val today = todayEpochDay()
+        if (adHintsDay != today) {
+            adHintsDay = today
+            adHintsCountToday = 0
+        }
+    }
+
+    fun adHintsRemainingToday(): Int {
+        rolloverIfNeeded()
+        return (MAX_AD_HINTS_A_DAY - adHintsCountToday).coerceAtLeast(0)
+    }
+
+    fun consume(): Boolean {
+        if (balance <= 0) return false
+        balance -= 1
+        return true
+    }
+
+    // Grants +1 hint credit from a watched ad, respecting the daily cap.
+    fun addFromAd(): Boolean {
+        rolloverIfNeeded()
+        if (adHintsCountToday >= MAX_AD_HINTS_A_DAY) return false
+        adHintsCountToday += 1
+        balance += 1
+        return true
+    }
+}
+
 // ─── GameState ─────────────────────────────────────────────────────────────────
 class GameState(
     private val puzzle: Puzzle,
@@ -555,13 +625,26 @@ fun RectaFormeApp() {
 
     val allPuzzles = puzzles!!
     val activity   = context as? Activity
-    val livesManager = remember { LivesManager(context) }
+    val livesManager    = remember { LivesManager(context) }
+    val progressManager = remember { ProgressManager(context) }
+    val hintsManager     = remember { HintsManager(context) }
 
     var currentScreen   by remember { mutableStateOf(Screen.HOME) }
     var levelIdx        by remember { mutableStateOf(0) }
     var darkMode        by remember { mutableStateOf(false) }
-    var completedLevels by remember { mutableStateOf(setOf<Int>()) }
+    var completedLevels by remember { mutableStateOf(progressManager.completedLevels) }
     var lives           by remember { mutableStateOf(livesManager.currentLives()) }
+    var hintsBalance    by remember { mutableStateOf(hintsManager.balance) }
+    var adHintsRemainingToday by remember { mutableStateOf(hintsManager.adHintsRemainingToday()) }
+
+    // Keep the status bar / navigation bar icons legible: white in dark mode, dark otherwise.
+    val view = LocalView.current
+    SideEffect {
+        val window = (view.context as? Activity)?.window ?: return@SideEffect
+        val controller = WindowCompat.getInsetsController(window, view)
+        controller.isAppearanceLightStatusBars = !darkMode
+        controller.isAppearanceLightNavigationBars = !darkMode
+    }
 
     fun handleInvalidPlacement() {
         val remaining = livesManager.loseLife()
@@ -604,7 +687,8 @@ fun RectaFormeApp() {
     // Auto-advance: when won → show results; results screen handles the 3-second countdown
     LaunchedEffect(gameState.isWon) {
         if (gameState.isWon) {
-            completedLevels = completedLevels + levelIdx
+            progressManager.markCompleted(levelIdx)
+            completedLevels = progressManager.completedLevels
             delay(600)                        // brief pause to let win animation play
             currentScreen = Screen.RESULTS
         }
@@ -617,13 +701,30 @@ fun RectaFormeApp() {
         currentScreen = Screen.PLAYING
     }
 
+    // Uses one hint from the free balance (5 on install, replenished by watching ads).
+    fun useHint() {
+        if (hintsManager.consume()) {
+            hintsBalance = hintsManager.balance
+            gameState.hint()
+        }
+    }
+
+    // Called after a rewarded ad completes: grants and immediately spends one hint credit
+    // (capped at HintsManager.MAX_AD_HINTS_A_DAY per calendar day).
+    fun grantHintFromAd() {
+        if (hintsManager.addFromAd()) {
+            hintsManager.consume()
+            hintsBalance = hintsManager.balance
+            adHintsRemainingToday = hintsManager.adHintsRemainingToday()
+            gameState.hint()
+        }
+    }
+
     MaterialTheme {
         when (currentScreen) {
             Screen.HOME -> HomeScreen(
-                darkMode    = darkMode,
-                levelIdx    = levelIdx,
-                totalLevels = allPuzzles.size,
-                onPlay      = { currentScreen = if (lives > 0) Screen.PLAYING else Screen.NO_LIVES }
+                darkMode = darkMode,
+                onPlay   = { currentScreen = if (lives > 0) Screen.PLAYING else Screen.NO_LIVES }
             )
 
             Screen.NO_LIVES -> NoLivesScreen(
@@ -643,6 +744,10 @@ fun RectaFormeApp() {
                 darkMode         = darkMode,
                 lives            = lives,
                 completedLevels  = completedLevels,
+                hintsBalance     = hintsBalance,
+                adHintsRemainingToday = adHintsRemainingToday,
+                onUseHint        = { useHint() },
+                onWatchAdForHint = { grantHintFromAd() },
                 onDarkModeToggle = { darkMode = !darkMode },
                 onBack           = { currentScreen = Screen.HOME },
                 onNextLevel      = { /* disabled during play */ },
@@ -673,6 +778,34 @@ fun RectaFormeApp() {
     }
 }
 
+// ─── Back arrow icon ────────────────────────────────────────────────────────────
+// Hand-drawn chevron instead of a text glyph, so it sits pixel-centred in its box
+// regardless of font metrics/baseline quirks.
+@Composable
+fun BackArrowIcon(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val strokeW = w * 0.16f
+        val tipX      = w * 0.30f
+        val edgeX     = w * 0.72f
+        val topY      = h * 0.22f
+        val midY      = h * 0.5f
+        val bottomY   = h * 0.78f
+
+        val path = Path().apply {
+            moveTo(edgeX, topY)
+            lineTo(tipX, midY)
+            lineTo(edgeX, bottomY)
+        }
+        drawPath(
+            path  = path,
+            color = color,
+            style = Stroke(width = strokeW, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        )
+    }
+}
+
 // ─── Hearts raw ────────────────────────────────────────────────────────────────
 @Composable
 fun HeartsRow(
@@ -692,13 +825,9 @@ fun HeartsRow(
 @Composable
 fun HomeScreen(
     darkMode: Boolean,
-    levelIdx: Int,
-    totalLevels: Int,
     onPlay: () -> Unit
 ) {
-    val bgColor    = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
-    val textColor  = if (darkMode) Color.White       else Color(0xFF1E293B)
-    val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
+    val bgColor = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
 
     val context = LocalContext.current
     val appIconBitmap = remember {
@@ -726,13 +855,7 @@ fun HomeScreen(
                 }
             }
 
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("AreaFill", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = Palette.amber)
-                Text(
-                    "Niveau ${levelIdx + 1} / $totalLevels",
-                    fontSize = 13.sp, color = mutedColor, fontWeight = FontWeight.SemiBold
-                )
-            }
+            Text("AreaFill", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = Palette.amber)
 
             Button(
                 onClick = onPlay,
@@ -1222,6 +1345,10 @@ fun GameScreen(
     darkMode: Boolean,
     lives: Int,
     completedLevels: Set<Int>,
+    hintsBalance: Int,
+    adHintsRemainingToday: Int,
+    onUseHint: () -> Unit,
+    onWatchAdForHint: () -> Unit,
     onDarkModeToggle: () -> Unit,
     onBack: () -> Unit,
     onNextLevel: () -> Unit,
@@ -1231,6 +1358,102 @@ fun GameScreen(
     val cardColor  = if (darkMode) Color(0xFF1E222B) else Color.White
     val textColor  = if (darkMode) Color.White       else Color(0xFF1E293B)
     val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
+
+    val context  = LocalContext.current
+    val activity = context as? Activity
+
+    var showHintConfirm  by remember { mutableStateOf(false) }
+    var showHintGranted  by remember { mutableStateOf(false) }
+    var rewardedAd by remember { mutableStateOf<RewardedAd?>(null) }
+
+    val canUseHint = hintsBalance > 0
+    val canWatchAdForHint = adHintsRemainingToday > 0
+
+    // Pre-load a rewarded ad whenever the daily cap hasn't been reached yet.
+    LaunchedEffect(adHintsRemainingToday) {
+        if (canWatchAdForHint && rewardedAd == null) {
+            RewardedAd.load(
+                context, AdIds.REWARDED, AdRequest.Builder().build(),
+                object : RewardedAdLoadCallback() {
+                    override fun onAdLoaded(ad: RewardedAd) { rewardedAd = ad }
+                    override fun onAdFailedToLoad(error: LoadAdError) { rewardedAd = null }
+                }
+            )
+        }
+    }
+
+    fun watchAdForHint() {
+        val ad = rewardedAd
+        val act = activity
+        if (ad != null && act != null) {
+            ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                override fun onAdDismissedFullScreenContent() { rewardedAd = null }
+            }
+            // onUserEarnedReward — the user watched the video to completion.
+            ad.show(act) { showHintGranted = true }
+        }
+    }
+
+    if (showHintConfirm) {
+        AlertDialog(
+            onDismissRequest = { showHintConfirm = false },
+            title = { Text("💡 Indice") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Un indice révèle un rectangle de la solution.")
+                    Text(
+                        if (canUseHint) "• Indices disponibles : $hintsBalance" else "• Plus d'indice en stock",
+                        fontSize = 12.sp
+                    )
+                    Text(
+                        if (canWatchAdForHint) "• Pubs restantes aujourd'hui : $adHintsRemainingToday / ${HintsManager.MAX_AD_HINTS_A_DAY}"
+                        else "• Limite quotidienne de pubs atteinte, reviens demain",
+                        fontSize = 12.sp
+                    )
+                }
+            },
+            confirmButton = {
+                when {
+                    canUseHint -> TextButton(onClick = { showHintConfirm = false; onUseHint() }) {
+                        Text("Utiliser l'indice", fontWeight = FontWeight.Bold)
+                    }
+                    canWatchAdForHint -> TextButton(
+                        onClick = { showHintConfirm = false; watchAdForHint() },
+                        enabled = rewardedAd != null
+                    ) {
+                        Text(if (rewardedAd != null) "🎬 Regarder une pub" else "⏳ Chargement…", fontWeight = FontWeight.Bold)
+                    }
+                    else -> TextButton(onClick = { showHintConfirm = false }) { Text("OK") }
+                }
+            },
+            dismissButton = {
+                if (canUseHint && canWatchAdForHint) {
+                    TextButton(
+                        onClick = { showHintConfirm = false; watchAdForHint() },
+                        enabled = rewardedAd != null
+                    ) {
+                        Text(if (rewardedAd != null) "🎬 Regarder une pub" else "⏳ Chargement…")
+                    }
+                } else {
+                    TextButton(onClick = { showHintConfirm = false }) { Text("Annuler") }
+                }
+            }
+        )
+    }
+
+    // Shown once the rewarded video has actually been watched, before the hint is revealed.
+    if (showHintGranted) {
+        AlertDialog(
+            onDismissRequest = { showHintGranted = false; onWatchAdForHint() },
+            title = { Text("🎉 Indice débloqué !") },
+            text = { Text("Merci d'avoir regardé la vidéo. Ton indice va être révélé sur la grille.") },
+            confirmButton = {
+                TextButton(onClick = { showHintGranted = false; onWatchAdForHint() }) {
+                    Text("OK", fontWeight = FontWeight.Bold)
+                }
+            }
+        )
+    }
 
     Box(Modifier.fillMaxSize().background(bgColor).statusBarsPadding()) {
         Column(Modifier.fillMaxSize()) {
@@ -1249,11 +1472,12 @@ fun GameScreen(
                     onClick = onBack,
                     modifier = Modifier
                         .align(Alignment.CenterStart)
-                        .clip(RoundedCornerShape(12.dp))
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(14.dp))
                         .background(cardColor)
-                        .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
+                        .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(14.dp))
                 ) {
-                    Text("←", fontSize = 18.sp, color = textColor)
+                    BackArrowIcon(color = Palette.amber, modifier = Modifier.size(20.dp))
                 }
 
                 Text(
@@ -1366,12 +1590,16 @@ fun GameScreen(
                             Text("↩ Annuler", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
                         OutlinedButton(
-                            onClick  = { gameState.hint() },
+                            onClick  = { showHintConfirm = true },
+                            enabled  = canUseHint || canWatchAdForHint,
                             modifier = Modifier.weight(1f).height(48.dp),
                             shape    = RoundedCornerShape(12.dp),
                             colors   = ButtonDefaults.outlinedButtonColors(contentColor = textColor)
                         ) {
-                            Text("💡 Indice", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            Text(
+                                if (canUseHint) "💡 Indice ($hintsBalance)" else "💡 Indice",
+                                fontWeight = FontWeight.Bold, fontSize = 13.sp
+                            )
                         }
                     }
                 }
