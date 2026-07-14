@@ -1,6 +1,8 @@
 package app.AreaFill
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Application
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -26,12 +28,25 @@ import androidx.compose.ui.input.pointer.*
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.*
+import androidx.compose.ui.viewinterop.AndroidView
+import com.google.android.gms.ads.AdError
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.AdSize
+import com.google.android.gms.ads.AdView
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.appopen.AppOpenAd
+import com.google.android.gms.ads.rewarded.RewardedAd
+import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import kotlin.collections.List
@@ -48,7 +63,7 @@ class MainActivity : ComponentActivity() {
 }
 
 // ─── Navigation screens ───────────────────────────────────────────────────────
-enum class Screen { PLAYING, RESULTS }
+enum class Screen { HOME, PLAYING, RESULTS, NO_LIVES, LIVES_INFO }
 
 // ─── Colour palette ────────────────────────────────────────────────────────────
 object Palette {
@@ -245,8 +260,128 @@ fun soundWin() {
     }
 }
 
+// ─── AdMob ─────────────────────────────────────────────────────────────────────
+object AdIds {
+    private val DEBUG = BuildConfig.DEBUG
+    val APP_OPEN = if (DEBUG) "ca-app-pub-3940256099942544/9257395921" else "ca-app-pub-2498267529185476/7422907016"
+    val REWARDED = if (DEBUG) "ca-app-pub-3940256099942544/5224354917" else "ca-app-pub-2498267529185476/7422907016"
+    val BANNER   = if (DEBUG) "ca-app-pub-3940256099942544/6300978111" else "ca-app-pub-2498267529185476/7384456564"
+}
+
+class AreaFillApplication : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        MobileAds.initialize(this)
+        AppOpenAdManager.loadAd(this)
+    }
+}
+
+// Loads a single App Open ad and shows it once, on the app's cold start.
+object AppOpenAdManager {
+    private var appOpenAd: AppOpenAd? = null
+    private var isLoadingAd = false
+    private var isShowingAd = false
+    private var hasShownOnce = false
+
+    fun loadAd(context: Context) {
+        if (isLoadingAd || appOpenAd != null) return
+        isLoadingAd = true
+        AppOpenAd.load(
+            context, AdIds.APP_OPEN, AdRequest.Builder().build(),
+            object : AppOpenAd.AppOpenAdLoadCallback() {
+                override fun onAdLoaded(ad: AppOpenAd) {
+                    appOpenAd = ad
+                    isLoadingAd = false
+                }
+                override fun onAdFailedToLoad(error: LoadAdError) {
+                    isLoadingAd = false
+                }
+            }
+        )
+    }
+
+    // Returns true once it's done trying (shown, already handled, or nothing to show yet is not final —
+    // caller should keep polling until this returns true or it gives up after a timeout).
+    fun maybeShow(activity: Activity): Boolean {
+        if (hasShownOnce || isShowingAd) return true
+        val ad = appOpenAd ?: return false
+        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+            override fun onAdDismissedFullScreenContent() {
+                appOpenAd = null; isShowingAd = false; hasShownOnce = true
+            }
+            override fun onAdFailedToShowFullScreenContent(error: AdError) {
+                appOpenAd = null; isShowingAd = false; hasShownOnce = true
+            }
+        }
+        isShowingAd = true
+        ad.show(activity)
+        return true
+    }
+
+    fun giveUpWaiting() { hasShownOnce = true }
+}
+
+// ─── Lives ─────────────────────────────────────────────────────────────────────
+class LivesManager(context: Context) {
+    companion object { const val MAX_LIVES = 3 }
+
+    private val prefs = context.applicationContext.getSharedPreferences("areafill_prefs", Context.MODE_PRIVATE)
+    private val regenIntervalMs = 60 * 60 * 1000L
+
+    private var livesPref: Int
+        get() = prefs.getInt("lives", MAX_LIVES)
+        set(value) = prefs.edit().putInt("lives", value).apply()
+
+    private var regenStartTs: Long
+        get() = prefs.getLong("regen_start_ts", 0L)
+        set(value) = prefs.edit().putLong("regen_start_ts", value).apply()
+
+    fun currentLives(): Int {
+        var lives = livesPref
+        var start = regenStartTs
+        if (lives < MAX_LIVES && start > 0L) {
+            val elapsed = System.currentTimeMillis() - start
+            val regenCount = (elapsed / regenIntervalMs).toInt()
+            if (regenCount > 0) {
+                lives = (lives + regenCount).coerceAtMost(MAX_LIVES)
+                start = if (lives >= MAX_LIVES) 0L else start + regenCount * regenIntervalMs
+                livesPref = lives
+                regenStartTs = start
+            }
+        }
+        return lives
+    }
+
+    fun loseLife(): Int {
+        val current = currentLives()
+        if (current <= 0) return 0
+        val next = current - 1
+        livesPref = next
+        if (regenStartTs == 0L) regenStartTs = System.currentTimeMillis()
+        return next
+    }
+
+    fun addLife(amount: Int = 1): Int {
+        val next = (currentLives() + amount).coerceAtMost(MAX_LIVES)
+        livesPref = next
+        if (next >= MAX_LIVES) regenStartTs = 0L
+        return next
+    }
+
+    fun millisUntilNextLife(): Long {
+        if (currentLives() >= MAX_LIVES) return 0L
+        val start = regenStartTs
+        if (start == 0L) return regenIntervalMs
+        val elapsed = System.currentTimeMillis() - start
+        return (regenIntervalMs - (elapsed % regenIntervalMs)).coerceIn(0L, regenIntervalMs)
+    }
+}
+
 // ─── GameState ─────────────────────────────────────────────────────────────────
-class GameState(private val puzzle: Puzzle) {
+class GameState(
+    private val puzzle: Puzzle,
+    private val onInvalidPlacement: () -> Unit = {}
+) {
     val size  = puzzle.size
     val clues = puzzle.clues
 
@@ -314,6 +449,7 @@ class GameState(private val puzzle: Puzzle) {
         } else {
             placedRects = filtered
             Thread { soundError() }.start()
+            onInvalidPlacement()
         }
     }
 
@@ -324,11 +460,10 @@ class GameState(private val puzzle: Puzzle) {
         Thread { soundSelect() }.start()
     }
 
-    @SuppressLint("NewApi")
     fun undo() {
         if (history.isEmpty()) return
         undosUsed++
-        placedRects = history.removeLast()
+        placedRects = history.removeAt(history.lastIndex)
         Thread { soundSelect() }.start()
     }
 
@@ -419,12 +554,43 @@ fun RectaFormeApp() {
     }
 
     val allPuzzles = puzzles!!
+    val activity   = context as? Activity
+    val livesManager = remember { LivesManager(context) }
 
-    var currentScreen   by remember { mutableStateOf(Screen.PLAYING) }
+    var currentScreen   by remember { mutableStateOf(Screen.HOME) }
     var levelIdx        by remember { mutableStateOf(0) }
     var darkMode        by remember { mutableStateOf(false) }
     var completedLevels by remember { mutableStateOf(setOf<Int>()) }
-    var gameState       by remember { mutableStateOf(GameState(allPuzzles[0])) }
+    var lives           by remember { mutableStateOf(livesManager.currentLives()) }
+
+    fun handleInvalidPlacement() {
+        val remaining = livesManager.loseLife()
+        lives = remaining
+        if (remaining <= 0) currentScreen = Screen.HOME
+    }
+
+    var gameState by remember {
+        mutableStateOf(GameState(allPuzzles[0], onInvalidPlacement = { handleInvalidPlacement() }))
+    }
+
+    // Try to show the App Open ad once it finishes loading (or give up after ~3s).
+    LaunchedEffect(Unit) {
+        activity?.let { act ->
+            repeat(15) {
+                if (AppOpenAdManager.maybeShow(act)) return@LaunchedEffect
+                delay(200)
+            }
+            AppOpenAdManager.giveUpWaiting()
+        }
+    }
+
+    // Passive life regen check while the app is open.
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            lives = livesManager.currentLives()
+        }
+    }
 
     LaunchedEffect(levelIdx, currentScreen) {
         if (currentScreen == Screen.PLAYING) {
@@ -447,22 +613,48 @@ fun RectaFormeApp() {
     fun goNextLevel() {
         val next  = if (levelIdx < allPuzzles.lastIndex) levelIdx + 1 else 0
         levelIdx      = next
-        gameState     = GameState(allPuzzles[next])
+        gameState     = GameState(allPuzzles[next], onInvalidPlacement = { handleInvalidPlacement() })
         currentScreen = Screen.PLAYING
     }
 
     MaterialTheme {
         when (currentScreen) {
+            Screen.HOME -> HomeScreen(
+                darkMode    = darkMode,
+                levelIdx    = levelIdx,
+                totalLevels = allPuzzles.size,
+                onPlay      = { currentScreen = if (lives > 0) Screen.PLAYING else Screen.NO_LIVES }
+            )
+
+            Screen.NO_LIVES -> NoLivesScreen(
+                darkMode     = darkMode,
+                livesManager = livesManager,
+                onLifeGained = { newLives ->
+                    lives = newLives
+                    currentScreen = Screen.PLAYING
+                },
+                onBack = { currentScreen = Screen.HOME }
+            )
+
             Screen.PLAYING -> GameScreen(
                 puzzle           = allPuzzles[levelIdx],
                 levelIdx         = levelIdx,
-                totalLevels      = allPuzzles.size,
                 gameState        = gameState,
                 darkMode         = darkMode,
+                lives            = lives,
                 completedLevels  = completedLevels,
                 onDarkModeToggle = { darkMode = !darkMode },
-                onBack           = { /* no menu – do nothing or show quit dialog */ },
-                onNextLevel      = { /* disabled during play */ }
+                onBack           = { currentScreen = Screen.HOME },
+                onNextLevel      = { /* disabled during play */ },
+                onLivesClick     = { currentScreen = Screen.LIVES_INFO }
+            )
+
+            Screen.LIVES_INFO -> LivesInfoScreen(
+                darkMode     = darkMode,
+                lives        = lives,
+                livesManager = livesManager,
+                onLifeGained = { newLives -> lives = newLives },
+                onBack       = { currentScreen = Screen.PLAYING }
             )
 
             Screen.RESULTS -> ResultsScreen(
@@ -479,6 +671,314 @@ fun RectaFormeApp() {
             )
         }
     }
+}
+
+// ─── Hearts raw ────────────────────────────────────────────────────────────────
+@Composable
+fun HeartsRow(
+    lives: Int,
+    maxLives: Int = LivesManager.MAX_LIVES,
+    fontSize: TextUnit = 16.sp,
+    modifier: Modifier = Modifier
+) {
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+        repeat(maxLives) { i ->
+            Text(if (i < lives) "❤️" else "🖤", fontSize = fontSize)
+        }
+    }
+}
+
+// ─── Home Screen ───────────────────────────────────────────────────────────────
+@Composable
+fun HomeScreen(
+    darkMode: Boolean,
+    levelIdx: Int,
+    totalLevels: Int,
+    onPlay: () -> Unit
+) {
+    val bgColor    = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
+    val textColor  = if (darkMode) Color.White       else Color(0xFF1E293B)
+    val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
+
+    val context = LocalContext.current
+    val appIconBitmap = remember {
+        ContextCompat.getDrawable(context, R.mipmap.ic_launcher)?.toBitmap()?.asImageBitmap()
+    }
+
+    Box(
+        Modifier.fillMaxSize().background(bgColor).statusBarsPadding(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.padding(28.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            Box(
+                Modifier
+                    .size(88.dp)
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(Palette.amber.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                appIconBitmap?.let {
+                    Image(bitmap = it, contentDescription = null, modifier = Modifier.size(64.dp))
+                }
+            }
+
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("AreaFill", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold, color = Palette.amber)
+                Text(
+                    "Niveau ${levelIdx + 1} / $totalLevels",
+                    fontSize = 13.sp, color = mutedColor, fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Button(
+                onClick = onPlay,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Palette.amber)
+            ) {
+                Text("▶ Jouer", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, color = Color.White)
+            }
+        }
+    }
+}
+
+// ─── No Lives Screen ───────────────────────────────────────────────────────────
+@Composable
+fun NoLivesScreen(
+    darkMode: Boolean,
+    livesManager: LivesManager,
+    onLifeGained: (Int) -> Unit,
+    onBack: () -> Unit
+) {
+    val context  = LocalContext.current
+    val activity = context as? Activity
+
+    val bgColor    = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
+    val cardColor  = if (darkMode) Color(0xFF1E222B) else Color.White
+    val textColor  = if (darkMode) Color.White       else Color(0xFF1E293B)
+    val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
+
+    var remainingMs by remember { mutableStateOf(livesManager.millisUntilNextLife()) }
+    var rewardedAd  by remember { mutableStateOf<RewardedAd?>(null) }
+
+    // Load a rewarded ad for this screen.
+    LaunchedEffect(Unit) {
+        RewardedAd.load(
+            context, AdIds.REWARDED, AdRequest.Builder().build(),
+            object : RewardedAdLoadCallback() {
+                override fun onAdLoaded(ad: RewardedAd) { rewardedAd = ad }
+                override fun onAdFailedToLoad(error: LoadAdError) { rewardedAd = null }
+            }
+        )
+    }
+
+    // Tick the countdown and detect free hourly regen.
+    LaunchedEffect(Unit) {
+        while (true) {
+            val current = livesManager.currentLives()
+            if (current > 0) {
+                onLifeGained(current)
+                return@LaunchedEffect
+            }
+            remainingMs = livesManager.millisUntilNextLife()
+            delay(1000)
+        }
+    }
+
+    val totalSeconds = (remainingMs / 1000).coerceAtLeast(0)
+    val mins = totalSeconds / 60
+    val secs = totalSeconds % 60
+
+    Box(
+        Modifier.fillMaxSize().background(bgColor).statusBarsPadding(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.padding(28.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(18.dp)
+        ) {
+            Text("💔", fontSize = 64.sp)
+            Text("Plus de vies", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = textColor)
+
+            Card(
+                Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = cardColor),
+                elevation = CardDefaults.cardElevation(2.dp)
+            ) {
+                Column(
+                    Modifier.padding(16.dp).fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("Prochaine vie dans", fontSize = 12.sp, color = mutedColor, fontWeight = FontWeight.Bold)
+                    Text(
+                        "%02d:%02d".format(mins, secs),
+                        fontSize = 28.sp, fontWeight = FontWeight.ExtraBold,
+                        fontFamily = FontFamily.Monospace, color = Palette.amber
+                    )
+                }
+            }
+
+            Button(
+                onClick = {
+                    val ad = rewardedAd
+                    val act = activity
+                    if (ad != null && act != null) {
+                        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                            override fun onAdDismissedFullScreenContent() { rewardedAd = null }
+                        }
+                        ad.show(act) { livesManager.addLife(1) }
+                    }
+                },
+                enabled = rewardedAd != null,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+            ) {
+                Text(
+                    if (rewardedAd != null) "🎬 Regarder une pub pour +1 vie" else "Chargement…",
+                    fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White
+                )
+            }
+
+            TextButton(onClick = onBack) {
+                Text("← Retour", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = mutedColor)
+            }
+        }
+    }
+}
+
+// ─── Lives Info Screen (tap on hearts) ──────────────────────────────────────────
+@Composable
+fun LivesInfoScreen(
+    darkMode: Boolean,
+    lives: Int,
+    livesManager: LivesManager,
+    onLifeGained: (Int) -> Unit,
+    onBack: () -> Unit
+) {
+    val context  = LocalContext.current
+    val activity = context as? Activity
+
+    val bgColor    = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
+    val cardColor  = if (darkMode) Color(0xFF1E222B) else Color.White
+    val textColor  = if (darkMode) Color.White       else Color(0xFF1E293B)
+    val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
+
+    var remainingMs by remember { mutableStateOf(livesManager.millisUntilNextLife()) }
+    var rewardedAd  by remember { mutableStateOf<RewardedAd?>(null) }
+
+    // Load a rewarded ad for this screen.
+    LaunchedEffect(Unit) {
+        RewardedAd.load(
+            context, AdIds.REWARDED, AdRequest.Builder().build(),
+            object : RewardedAdLoadCallback() {
+                override fun onAdLoaded(ad: RewardedAd) { rewardedAd = ad }
+                override fun onAdFailedToLoad(error: LoadAdError) { rewardedAd = null }
+            }
+        )
+    }
+
+    // Tick the countdown and pick up passive hourly regen while this screen is open.
+    LaunchedEffect(Unit) {
+        while (true) {
+            val current = livesManager.currentLives()
+            if (current != lives) onLifeGained(current)
+            remainingMs = livesManager.millisUntilNextLife()
+            delay(1000)
+        }
+    }
+
+    val totalSeconds = (remainingMs / 1000).coerceAtLeast(0)
+    val hours = totalSeconds / 3600
+    val mins  = (totalSeconds % 3600) / 60
+    val secs  = totalSeconds % 60
+    val atMax = lives >= LivesManager.MAX_LIVES
+
+    Box(
+        Modifier.fillMaxSize().background(bgColor).statusBarsPadding(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.padding(28.dp).fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(18.dp)
+        ) {
+            HeartsRow(lives = lives, fontSize = 40.sp)
+            Text("Vies", fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, color = textColor)
+
+            if (!atMax) {
+                Card(
+                    Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = cardColor),
+                    elevation = CardDefaults.cardElevation(2.dp)
+                ) {
+                    Column(
+                        Modifier.padding(16.dp).fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("Prochaine vie dans", fontSize = 12.sp, color = mutedColor, fontWeight = FontWeight.Bold)
+                        Text(
+                            "%02d:%02d:%02d".format(hours, mins, secs),
+                            fontSize = 28.sp, fontWeight = FontWeight.ExtraBold,
+                            fontFamily = FontFamily.Monospace, color = Palette.amber
+                        )
+                    }
+                }
+            }
+
+            Button(
+                onClick = {
+                    val ad = rewardedAd
+                    val act = activity
+                    if (ad != null && act != null) {
+                        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+                            override fun onAdDismissedFullScreenContent() { rewardedAd = null }
+                        }
+                        ad.show(act) { onLifeGained(livesManager.addLife(1)) }
+                    }
+                },
+                enabled = rewardedAd != null && !atMax,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+            ) {
+                Text(
+                    when {
+                        atMax             -> "Vies au maximum"
+                        rewardedAd != null -> "🎬 Regarder une pub pour +1 vie"
+                        else               -> "Chargement…"
+                    },
+                    fontWeight = FontWeight.ExtraBold, fontSize = 14.sp, color = Color.White
+                )
+            }
+
+            TextButton(onClick = onBack) {
+                Text("← Retour", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = mutedColor)
+            }
+        }
+    }
+}
+
+// ─── AdMob Banner ──────────────────────────────────────────────────────────────
+@Composable
+fun AdMobBanner(modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier.fillMaxWidth(),
+        factory = { ctx ->
+            AdView(ctx).apply {
+                setAdSize(AdSize.BANNER)
+                adUnitId = AdIds.BANNER
+                loadAd(AdRequest.Builder().build())
+            }
+        }
+    )
 }
 
 // ─── Results Screen ────────────────────────────────────────────────────────────
@@ -582,7 +1082,7 @@ fun ResultsScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Animated stars row
+                    // Animated stars raw
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -718,13 +1218,14 @@ fun ResultsScreen(
 fun GameScreen(
     puzzle: Puzzle,
     levelIdx: Int,
-    totalLevels: Int,
     gameState: GameState,
     darkMode: Boolean,
+    lives: Int,
     completedLevels: Set<Int>,
     onDarkModeToggle: () -> Unit,
     onBack: () -> Unit,
-    onNextLevel: () -> Unit
+    onNextLevel: () -> Unit,
+    onLivesClick: () -> Unit
 ) {
     val bgColor    = if (darkMode) Color(0xFF15171C) else Color(0xFFF4F4F1)
     val cardColor  = if (darkMode) Color(0xFF1E222B) else Color.White
@@ -732,36 +1233,56 @@ fun GameScreen(
     val mutedColor = if (darkMode) Color(0xFF94A3B8) else Color(0xFF64748B)
 
     Box(Modifier.fillMaxSize().background(bgColor).statusBarsPadding()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            // ── Header ──────────────────────────────────────────────────────
-            Row(
-                Modifier.fillMaxWidth().padding(bottom = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+        Column(Modifier.fillMaxSize()) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Column {
-                        Text("AreaFill", fontWeight = FontWeight.ExtraBold, fontSize = 22.sp, color = Palette.amber)
-                        Text(
-                            "Niveau ${levelIdx + 1} / $totalLevels",
-                            fontSize = 11.sp, color = mutedColor, fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
+            // ── Header ──────────────────────────────────────────────────────
+            Box(
+                Modifier.fillMaxWidth().padding(bottom = 12.dp)
+            ) {
                 IconButton(
-                    onClick = onDarkModeToggle,
+                    onClick = onBack,
                     modifier = Modifier
+                        .align(Alignment.CenterStart)
                         .clip(RoundedCornerShape(12.dp))
                         .background(cardColor)
                         .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
                 ) {
-                    Text(if (darkMode) "☀️" else "🌙", fontSize = 18.sp)
+                    Text("←", fontSize = 18.sp, color = textColor)
+                }
+
+                Text(
+                    "AreaFill",
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 20.sp,
+                    color = Palette.amber,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+
+                Row(
+                    modifier = Modifier.align(Alignment.CenterEnd),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    HeartsRow(
+                        lives = lives,
+                        fontSize = 15.sp,
+                        modifier = Modifier.clickable(onClick = onLivesClick)
+                    )
+                    IconButton(
+                        onClick = onDarkModeToggle,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(cardColor)
+                            .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(12.dp))
+                    ) {
+                        Text(if (darkMode) "☀️" else "🌙", fontSize = 18.sp)
+                    }
                 }
             }
 
@@ -858,12 +1379,8 @@ fun GameScreen(
 
             // ── Legend ───────────────────────────────────────────────────────
             ShapeLegendCard(cardColor = cardColor, textColor = textColor, mutedColor = mutedColor)
-
-            Spacer(Modifier.height(8.dp))
-
-            TextButton(onClick = { gameState.reset() }) {
-                Text("🔄 Recommencer la grille", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = mutedColor)
             }
+            AdMobBanner(Modifier.navigationBarsPadding())
         }
     }
 }
