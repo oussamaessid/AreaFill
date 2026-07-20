@@ -9,8 +9,10 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -325,7 +327,7 @@ object AppOpenAdManager {
 
 // ─── Lives ─────────────────────────────────────────────────────────────────────
 class LivesManager(context: Context) {
-    companion object { const val MAX_LIVES = 3 }
+    companion object { const val MAX_LIVES = 5 }
 
     private val prefs = context.applicationContext.getSharedPreferences("areafill_prefs", Context.MODE_PRIVATE)
     private val regenIntervalMs = 60 * 60 * 1000L
@@ -646,10 +648,92 @@ fun RectaFormeApp() {
         controller.isAppearanceLightNavigationBars = !darkMode
     }
 
+    var mistakeTrigger by remember { mutableStateOf(0) }
+
     fun handleInvalidPlacement() {
         val remaining = livesManager.loseLife()
         lives = remaining
+        mistakeTrigger++
         if (remaining <= 0) currentScreen = Screen.HOME
+    }
+
+    // Broken-heart feedback shown whenever a mistake costs a life: a punchy
+    // scale/rotation bounce over a darkened scrim, plus a shake on the hearts
+    // counter, so the "you just lost a life" cause-and-effect reads clearly.
+    // Hoisted above GameScreen so it only replays on an actual new mistake,
+    // not every time GameScreen re-enters composition (e.g. after watching
+    // a rewarded ad and returning from the lives screen).
+    val brokenHeartScale    = remember { Animatable(1f) }
+    val brokenHeartRotation = remember { Animatable(0f) }
+    val brokenHeartAlpha    = remember { Animatable(0f) }
+    val heartsShakeX        = remember { Animatable(0f) }
+    LaunchedEffect(mistakeTrigger) {
+        if (mistakeTrigger > 0) {
+            brokenHeartAlpha.snapTo(1f)
+            brokenHeartScale.snapTo(0.3f)
+            brokenHeartRotation.snapTo(0f)
+            launch {
+                brokenHeartScale.animateTo(
+                    targetValue = 1f,
+                    animationSpec = keyframes {
+                        durationMillis = 550
+                        0.3f at 0
+                        1.3f at 220 using FastOutSlowInEasing
+                        0.9f at 380 using FastOutSlowInEasing
+                        1.05f at 470 using FastOutSlowInEasing
+                        1f at 550
+                    }
+                )
+            }
+            launch {
+                brokenHeartRotation.animateTo(
+                    targetValue = 0f,
+                    animationSpec = keyframes {
+                        durationMillis = 550
+                        0f at 0
+                        (-14f) at 90
+                        12f at 180
+                        (-8f) at 280
+                        5f at 380
+                        0f at 550
+                    }
+                )
+            }
+            launch {
+                heartsShakeX.animateTo(
+                    targetValue = 0f,
+                    animationSpec = keyframes {
+                        durationMillis = 400
+                        0f at 0
+                        (-10f) at 60
+                        10f at 120
+                        (-8f) at 180
+                        8f at 240
+                        (-4f) at 300
+                        0f at 400
+                    }
+                )
+            }
+            delay(650)
+            brokenHeartAlpha.animateTo(0f, animationSpec = tween(300))
+        }
+    }
+
+    // "+1 vie" feedback shown once a rewarded-ad life lands back on the game
+    // screen. Hoisted here (rather than in NoLivesScreen/LivesInfoScreen) so it
+    // plays directly over the grid, after navigation, instead of on the
+    // intermediate lives screen.
+    var lifeGainTrigger by remember { mutableStateOf(0) }
+    val lifeGainScale = remember { Animatable(1f) }
+    val lifeGainAlpha = remember { Animatable(0f) }
+    LaunchedEffect(lifeGainTrigger) {
+        if (lifeGainTrigger > 0) playLifeGainedBounce(lifeGainScale, lifeGainAlpha)
+    }
+
+    fun handleAdLifeGained(newLives: Int) {
+        lives = newLives
+        lifeGainTrigger++
+        currentScreen = Screen.PLAYING
     }
 
     var gameState by remember {
@@ -720,6 +804,19 @@ fun RectaFormeApp() {
         }
     }
 
+    // System back button: navigate back through in-app screens instead of
+    // quitting. Only on HOME is back left unhandled, so the system's default
+    // behaviour (finish the Activity) applies there.
+    BackHandler(enabled = currentScreen != Screen.HOME) {
+        currentScreen = when (currentScreen) {
+            Screen.PLAYING    -> Screen.HOME
+            Screen.NO_LIVES   -> Screen.HOME
+            Screen.LIVES_INFO -> Screen.PLAYING
+            Screen.RESULTS    -> Screen.HOME
+            Screen.HOME       -> Screen.HOME
+        }
+    }
+
     MaterialTheme {
         when (currentScreen) {
             Screen.HOME -> HomeScreen(
@@ -734,6 +831,7 @@ fun RectaFormeApp() {
                     lives = newLives
                     currentScreen = Screen.PLAYING
                 },
+                onAdLifeGained = { newLives -> handleAdLifeGained(newLives) },
                 onBack = { currentScreen = Screen.HOME }
             )
 
@@ -743,6 +841,12 @@ fun RectaFormeApp() {
                 gameState        = gameState,
                 darkMode         = darkMode,
                 lives            = lives,
+                brokenHeartScale    = brokenHeartScale,
+                brokenHeartRotation = brokenHeartRotation,
+                brokenHeartAlpha    = brokenHeartAlpha,
+                heartsShakeX        = heartsShakeX,
+                lifeGainScale       = lifeGainScale,
+                lifeGainAlpha       = lifeGainAlpha,
                 completedLevels  = completedLevels,
                 hintsBalance     = hintsBalance,
                 adHintsRemainingToday = adHintsRemainingToday,
@@ -759,6 +863,7 @@ fun RectaFormeApp() {
                 lives        = lives,
                 livesManager = livesManager,
                 onLifeGained = { newLives -> lives = newLives },
+                onAdLifeGained = { newLives -> handleAdLifeGained(newLives) },
                 onBack       = { currentScreen = Screen.PLAYING }
             )
 
@@ -821,6 +926,63 @@ fun HeartsRow(
     }
 }
 
+// ─── Life-gained animation ──────────────────────────────────────────────────────
+// Positive counterpart to the in-game broken-heart feedback: a bouncing heart
+// over a green scrim, played once after a rewarded ad grants +1 life, right
+// before automatically returning to the game.
+@Composable
+fun LifeGainedOverlay(scale: Float, alpha: Float) {
+    if (alpha <= 0f) return
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFF10B981).copy(alpha = 0.20f * alpha)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                "❤️",
+                fontSize = 100.sp,
+                modifier = Modifier.graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    this.alpha = alpha
+                }
+            )
+            Text(
+                "+1 vie",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF10B981),
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .graphicsLayer { this.alpha = alpha }
+            )
+        }
+    }
+}
+
+suspend fun playLifeGainedBounce(
+    scaleAnim: Animatable<Float, AnimationVector1D>,
+    alphaAnim: Animatable<Float, AnimationVector1D>
+) {
+    alphaAnim.snapTo(1f)
+    scaleAnim.snapTo(0.3f)
+    scaleAnim.animateTo(
+        targetValue = 1f,
+        animationSpec = keyframes {
+            durationMillis = 550
+            0.3f at 0
+            1.3f at 220 using FastOutSlowInEasing
+            0.9f at 380 using FastOutSlowInEasing
+            1.05f at 470 using FastOutSlowInEasing
+            1f at 550
+        }
+    )
+    delay(500)
+    alphaAnim.animateTo(0f, animationSpec = tween(300))
+}
+
 // ─── Home Screen ───────────────────────────────────────────────────────────────
 @Composable
 fun HomeScreen(
@@ -875,6 +1037,7 @@ fun NoLivesScreen(
     darkMode: Boolean,
     livesManager: LivesManager,
     onLifeGained: (Int) -> Unit,
+    onAdLifeGained: (Int) -> Unit,
     onBack: () -> Unit
 ) {
     val context  = LocalContext.current
@@ -952,10 +1115,17 @@ fun NoLivesScreen(
                     val ad = rewardedAd
                     val act = activity
                     if (ad != null && act != null) {
+                        var earnedReward = false
                         ad.fullScreenContentCallback = object : FullScreenContentCallback() {
-                            override fun onAdDismissedFullScreenContent() { rewardedAd = null }
+                            // Reward is granted while the ad is still full-screen; wait until it
+                            // actually closes, then jump straight back into the game — the "+1 vie"
+                            // animation plays there, over the grid, where the user can see it.
+                            override fun onAdDismissedFullScreenContent() {
+                                rewardedAd = null
+                                if (earnedReward) onAdLifeGained(livesManager.addLife(1))
+                            }
                         }
-                        ad.show(act) { livesManager.addLife(1) }
+                        ad.show(act) { earnedReward = true }
                     }
                 },
                 enabled = rewardedAd != null,
@@ -983,6 +1153,7 @@ fun LivesInfoScreen(
     lives: Int,
     livesManager: LivesManager,
     onLifeGained: (Int) -> Unit,
+    onAdLifeGained: (Int) -> Unit,
     onBack: () -> Unit
 ) {
     val context  = LocalContext.current
@@ -1061,10 +1232,17 @@ fun LivesInfoScreen(
                     val ad = rewardedAd
                     val act = activity
                     if (ad != null && act != null) {
+                        var earnedReward = false
                         ad.fullScreenContentCallback = object : FullScreenContentCallback() {
-                            override fun onAdDismissedFullScreenContent() { rewardedAd = null }
+                            // Reward is granted while the ad is still full-screen; wait until it
+                            // actually closes, then jump straight back into the game — the "+1 vie"
+                            // animation plays there, over the grid, where the user can see it.
+                            override fun onAdDismissedFullScreenContent() {
+                                rewardedAd = null
+                                if (earnedReward) onAdLifeGained(livesManager.addLife(1))
+                            }
                         }
-                        ad.show(act) { onLifeGained(livesManager.addLife(1)) }
+                        ad.show(act) { earnedReward = true }
                     }
                 },
                 enabled = rewardedAd != null && !atMax,
@@ -1177,12 +1355,6 @@ fun ResultsScreen(
                     fontSize = 30.sp,
                     fontWeight = FontWeight.ExtraBold,
                     color = Palette.amber
-                )
-                Text(
-                    puzzle.name,
-                    fontSize = 14.sp,
-                    color = mutedColor,
-                    fontWeight = FontWeight.SemiBold
                 )
                 Text(
                     "Niveau ${levelIdx + 1} / $totalLevels",
@@ -1344,6 +1516,12 @@ fun GameScreen(
     gameState: GameState,
     darkMode: Boolean,
     lives: Int,
+    brokenHeartScale: Animatable<Float, AnimationVector1D>,
+    brokenHeartRotation: Animatable<Float, AnimationVector1D>,
+    brokenHeartAlpha: Animatable<Float, AnimationVector1D>,
+    heartsShakeX: Animatable<Float, AnimationVector1D>,
+    lifeGainScale: Animatable<Float, AnimationVector1D>,
+    lifeGainAlpha: Animatable<Float, AnimationVector1D>,
     completedLevels: Set<Int>,
     hintsBalance: Int,
     adHintsRemainingToday: Int,
@@ -1465,38 +1643,45 @@ fun GameScreen(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
             // ── Header ──────────────────────────────────────────────────────
-            Box(
-                Modifier.fillMaxWidth().padding(bottom = 12.dp)
+            Row(
+                Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .align(Alignment.CenterStart)
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(cardColor)
-                        .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(14.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    BackArrowIcon(color = Palette.amber, modifier = Modifier.size(20.dp))
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(cardColor)
+                            .border(1.dp, if (darkMode) Color(0xFF1E293B) else Color(0xFFE2E8F0), RoundedCornerShape(14.dp))
+                    ) {
+                        BackArrowIcon(color = Palette.amber, modifier = Modifier.size(20.dp))
+                    }
+
+                    Text(
+                        "AreaFill",
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 20.sp,
+                        color = Palette.amber
+                    )
                 }
 
-                Text(
-                    "AreaFill",
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize = 20.sp,
-                    color = Palette.amber,
-                    modifier = Modifier.align(Alignment.Center)
-                )
-
                 Row(
-                    modifier = Modifier.align(Alignment.CenterEnd),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     HeartsRow(
                         lives = lives,
                         fontSize = 15.sp,
-                        modifier = Modifier.clickable(onClick = onLivesClick)
+                        modifier = Modifier
+                            .padding(end = 6.dp)
+                            .graphicsLayer { translationX = heartsShakeX.value }
+                            .clickable(onClick = onLivesClick)
                     )
                     IconButton(
                         onClick = onDarkModeToggle,
@@ -1550,7 +1735,7 @@ fun GameScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(puzzle.name, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, color = textColor)
+                        Text("Niveau ${levelIdx + 1}", fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, color = textColor)
                         if (completedLevels.contains(levelIdx)) {
                             Box(
                                 Modifier
@@ -1610,6 +1795,39 @@ fun GameScreen(
             }
             AdMobBanner(Modifier.navigationBarsPadding())
         }
+
+        if (brokenHeartAlpha.value > 0f) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.25f * brokenHeartAlpha.value)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "💔",
+                        fontSize = 100.sp,
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = brokenHeartScale.value
+                            scaleY = brokenHeartScale.value
+                            rotationZ = brokenHeartRotation.value
+                            alpha = brokenHeartAlpha.value
+                        }
+                    )
+                    Text(
+                        "-1 vie",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.White,
+                        modifier = Modifier
+                            .padding(top = 4.dp)
+                            .graphicsLayer { alpha = brokenHeartAlpha.value }
+                    )
+                }
+            }
+        }
+
+        LifeGainedOverlay(scale = lifeGainScale.value, alpha = lifeGainAlpha.value)
     }
 }
 

@@ -13,7 +13,7 @@ android {
         applicationId = "app.AreaFill"
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
+        versionCode = 10
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
