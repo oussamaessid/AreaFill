@@ -392,6 +392,12 @@ class ProgressManager(context: Context) {
             .toSet()
         private set(value) = prefs.edit().putString("completed_levels", value.joinToString(",")).apply()
 
+    // Last level the user was playing, so relaunching the app resumes there
+    // instead of always restarting from level 1.
+    var lastLevelIdx: Int
+        get() = prefs.getInt("last_level_idx", 0)
+        set(value) = prefs.edit().putInt("last_level_idx", value).apply()
+
     fun markCompleted(levelIdx: Int) {
         completedLevels = completedLevels + levelIdx
     }
@@ -632,7 +638,9 @@ fun RectaFormeApp() {
     val hintsManager     = remember { HintsManager(context) }
 
     var currentScreen   by remember { mutableStateOf(Screen.HOME) }
-    var levelIdx        by remember { mutableStateOf(0) }
+    var levelIdx        by remember {
+        mutableStateOf(progressManager.lastLevelIdx.coerceIn(0, allPuzzles.lastIndex))
+    }
     var darkMode        by remember { mutableStateOf(false) }
     var completedLevels by remember { mutableStateOf(progressManager.completedLevels) }
     var lives           by remember { mutableStateOf(livesManager.currentLives()) }
@@ -737,7 +745,7 @@ fun RectaFormeApp() {
     }
 
     var gameState by remember {
-        mutableStateOf(GameState(allPuzzles[0], onInvalidPlacement = { handleInvalidPlacement() }))
+        mutableStateOf(GameState(allPuzzles[levelIdx], onInvalidPlacement = { handleInvalidPlacement() }))
     }
 
     // Try to show the App Open ad once it finishes loading (or give up after ~3s).
@@ -757,6 +765,11 @@ fun RectaFormeApp() {
             delay(30_000)
             lives = livesManager.currentLives()
         }
+    }
+
+    // Persist the current level so relaunching the app resumes here instead of level 1.
+    LaunchedEffect(levelIdx) {
+        progressManager.lastLevelIdx = levelIdx
     }
 
     LaunchedEffect(levelIdx, currentScreen) {
